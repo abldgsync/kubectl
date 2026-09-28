@@ -1,8 +1,8 @@
 name: Do Tools Sync For Abldg
 
 on:
-  schedule:
-    - cron: '0 2 10 * *'  # 每月10号凌晨2点自动执行(使用最新稳定版)
+  # schedule:
+  #   - cron: '0 2 10 * *'  # 每月10号凌晨2点自动执行(已屏蔽,不再定时执行)
   workflow_dispatch:
     inputs:
       binvern:
