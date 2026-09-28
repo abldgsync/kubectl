@@ -2,7 +2,7 @@ name: Full Sync
 
 on:
   schedule:
-   - cron: '0 2 10 * *'  # 每月10号2点自动执行(使用最新版本)
+    - cron: '0 2 10 * *'  # 每月10号凌晨2点自动执行(使用最新稳定版)
   workflow_dispatch:
     inputs:
       binvern:
@@ -13,7 +13,7 @@ on:
         description: '包含 SERVER 及 NODE 版本,取值(=0|1)'
         required: false
         type: int
-        default: 1
+        default: 0
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: 拉取仓库代码
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: 解析版本并生成下载清单
         id: plan
@@ -47,13 +47,11 @@ jobs:
           auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
 
           # 1. 确定目标版本:指定版本用 tags 接口精确命中,未指定用 latest
+          vnstr=latest
           if [[ -n "${WANT:-}" ]]; then
-            tag="v${WANT#v}"
-            curl -fsSL --retry 3 --retry-delay 2 "${auth[@]}" "${API}/tags/${tag}" -o rel.json
-          else
-            curl -fsSL --retry 3 --retry-delay 2 "${auth[@]}" "${API}/latest" -o rel.json
+            vnstr="tags/v${WANT#v}"
           fi
-          VN=$(jq -r '.tag_name' rel.json)
+          VN=$(curl -fsSL --retry 3 --retry-delay 2 "${auth[@]}" "${API}/${vnstr}" | jq -r '.tag_name')
 
           # 最新版可能是预发布,兜底跳过 rc/beta/alpha
           if [[ "${VN}" =~ -(rc|beta|alpha) ]]; then
@@ -62,87 +60,45 @@ jobs:
           fi
 
           # 2. 生成下载清单
-          #    二进制下载路径来自官方 CHANGELOG 对应版本小节的 "Binaries" 段落,
-          #    而非硬编码平台列表,从而保证与官网一致(架构/包名随版本变化)。
-          MM=$(echo "${VN}" | sed -E 's/^v([0-9]+\.[0-9]+)\.[0-9]+$/\1/')
-          # 官方 CHANGELOG 文件位于仓库 CHANGELOG/CHANGELOG-<major>.<minor>.md
-          # (用 github.com 的 /raw/ 路径获取原始文本,blob 路径会返回 HTML 页面)
-          curl -fsSL --retry 3 "https://github.com/${OWN}/raw/master/CHANGELOG/CHANGELOG-${MM}.md" -o CHLOG.md
+          #    直接从官方 SHA512SUMS 获取 tar.gz 文件列表与校验值,下载 URL 由 "base/文件名" 组装。
+          curl -fsSL --retry 3 "https://dl.k8s.io/${VN}/SHA512SUMS" -o "${RUNNER_TEMP}/SHA512SUMS"
 
-          # 截取本版本小节(从 "## [vX.Y.Z]" 到下一个 "## [" 之间)
-          awk -v ver="${VN}" '
-            /^## \[/ {
-              if (index($0, "[" ver "]") > 0) { p=1; next }
-              else if (p) { exit }
-            }
-            p { print }
-          ' CHLOG.md > sec.txt
-
-          # 从指定小节抽取 k8s 二进制下载 URL(dl.k8s.io 上的 *.tar.gz)
-          extract() {
-            awk -v pat="$1" '$0 ~ "^### .*" pat {f=1;next} /^### /{f=0} f' sec.txt \
-              | grep -oE 'https://dl\.k8s\.io/'"${VN}"'/kubernetes-[^)]+\.tar\.gz'
-          }
-
-          {
-            extract "Client Binaries"
-            # 完整源码包 kubernetes.tar.gz 位于 Source Code 小节
-            awk '/^### .*Source Code/{f=1;next} /^### /{f=0} f' sec.txt \
-              | grep -oE 'https://dl\.k8s\.io/'"${VN}"'/kubernetes\.tar\.gz'
-          } > "${RUNNER_TEMP}/manifest.txt"
-
+          # 取 tar.gz 包条目(默认仅 client + 完整包,开启 withsvr 时含 server/node)
+          pat='kubernetes\.tar\.gz$|kubernetes-client-.*tar\.gz$'
           if [[ "${WXSV:-0}" == "1" ]]; then
-            extract "Server Binaries" >> "${RUNNER_TEMP}/manifest.txt"
-            extract "Node Binaries"   >> "${RUNNER_TEMP}/manifest.txt"
+            pat='kubernetes\.tar\.gz$|kubernetes-(client|server|node)-.*tar\.gz$'
           fi
-
-          # 兜底:CHANGELOG 解析失败(如网络异常)时,退回固定平台列表构造 URL
-          if [[ ! -s "${RUNNER_TEMP}/manifest.txt" ]]; then
-            {
-              echo "https://dl.k8s.io/${VN}/kubernetes.tar.gz"
-              for n in client-linux-{386,amd64,arm,arm64,ppc64le,s390x} \
-                       client-darwin-{amd,arm}64 client-windows-{386,amd64,arm64}; do
-                echo "https://dl.k8s.io/${VN}/kubernetes-${n}.tar.gz"
-              done
-              if [[ "${WXSV:-0}" == "1" ]]; then
-                for n in server-linux-{amd64,arm64,ppc64le,s390x} \
-                         node-linux-{amd64,arm64,ppc64le,s390x} node-windows-amd64; do
-                  echo "https://dl.k8s.io/${VN}/kubernetes-${n}.tar.gz"
-                done
-              fi
-            } > "${RUNNER_TEMP}/manifest.txt"
-          fi
+          grep -E "$pat" "${RUNNER_TEMP}/SHA512SUMS" > "${RUNNER_TEMP}/manifest.sums"
 
           # 过滤不支持的架构(如 loong)
-          grep -v 'loong' "${RUNNER_TEMP}/manifest.txt" > "${RUNNER_TEMP}/manifest.filtered.txt"
-          mv "${RUNNER_TEMP}/manifest.filtered.txt" "${RUNNER_TEMP}/manifest.txt"
+          grep -v 'loong' "${RUNNER_TEMP}/manifest.sums" > "${RUNNER_TEMP}/manifest.filtered.txt"
+          mv "${RUNNER_TEMP}/manifest.filtered.txt" "${RUNNER_TEMP}/manifest.sums"
 
-          if [[ ! -s "${RUNNER_TEMP}/manifest.txt" ]]; then
+          if [[ ! -s "${RUNNER_TEMP}/manifest.sums" ]]; then
             echo "::error::未找到任何可下载资源"
             exit 1
           fi
 
           echo "version=${VN}" >> "${GITHUB_OUTPUT}"
-          echo "count=$(wc -l < "${RUNNER_TEMP}/manifest.txt")" >> "${GITHUB_OUTPUT}"
+          echo "count=$(wc -l < "${RUNNER_TEMP}/manifest.sums")" >> "${GITHUB_OUTPUT}"
           echo "base_url=https://dl.k8s.io/${VN}" >> "${GITHUB_OUTPUT}"
-          echo "解析到版本: ${VN} ($(wc -l < "${RUNNER_TEMP}/manifest.txt") 个资源)"
+          echo "解析到版本: ${VN} ($(wc -l < "${RUNNER_TEMP}/manifest.sums") 个资源)"
 
       - name: 并行下载全部二进制包
         env:
           JOBS: ${{ env.DOWNLOAD_JOBS }}
+          VN: ${{ steps.plan.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          export dist="dist"
 
           download_one() {
-            local url="$1"
-            local name
-            name=$(basename "${url}")
+            local sum="$1" name="$2"
+            local url="https://dl.k8s.io/${VN}/${name}"
             for i in 1 2 3; do
               if curl -4fL --retry 3 --retry-all-errors --retry-delay 2 \
                     --connect-timeout 15 --max-time 1200 \
-                    -o "${dist}/${name}" "${url}"; then
+                    -o "dist/${name}" "${url}"; then
                 return 0
               fi
               sleep $((i * 3))
@@ -152,25 +108,16 @@ jobs:
           }
           export -f download_one
 
-          # 清单中为完整下载 URL,并行下载,任一失败即整体失败
-          xargs -a "${RUNNER_TEMP}/manifest.txt" -I{} -P "${JOBS}" \
-            bash -c 'download_one "$@"' _ {}
+          # 清单每行: "<sha512>  <文件名>",取两列(校验值+文件名)并行下载,任一失败即整体失败
+          xargs -P "${JOBS}" -n 2 bash -c 'download_one "$@"' _ < "${RUNNER_TEMP}/manifest.sums"
           echo "下载完成,文件数: $(find dist -type f | wc -l)"
 
-      - name: 校验 SHA256
-        env:
-          VN: ${{ steps.plan.outputs.version }}
+      - name: 校验完整性(SHA512)
         run: |
           set -euo pipefail
-          curl -4fsSL --retry 3 "https://dl.k8s.io/${VN}/SHA256SUMS" -o dist/SHA256SUMS
           cd dist
-          # 仅校验实际已下载的文件
-          while IFS= read -r line; do
-            fname=$(echo "$line" | awk '{print $2}')
-            [[ -f "$fname" ]] && echo "$line"
-          done < SHA256SUMS > SHA256SUMS.check
-          rm -f SHA256SUMS
-          sha256sum -c SHA256SUMS.check
+          # 用 SHA512SUMS 中解析出的校验值逐文件校验
+          sha512sum -c "${RUNNER_TEMP}/manifest.sums"
 
       - name: 发布到 Releases
         if: steps.plan.outputs.count != '0'

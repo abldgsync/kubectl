@@ -9,9 +9,9 @@
 1. **解析版本并生成下载清单**
    - 未指定版本时使用 GitHub API 的 `latest` 接口获取最新稳定版;指定版本时通过 `tags/<version>` 接口精确命中.
    - 若解析到预发布版本(`rc`/`beta`/`alpha`)则直接报错退出,避免误发非稳定版.
-   - **下载路径取自官方 CHANGELOG**:拉取 `kubernetes/kubernetes` 对应版本的 `CHANGELOG-<major>.<minor>.md`,截取该版本小节的 `Client / Server / Node Binaries` 段落,提取其中 `dl.k8s.io` 上的 `*.tar.gz` 下载链接(默认仅客户端,开启 `withsvr` 时含 server/node).这样能随版本自动适配架构与包名,而非写死平台列表.解析失败时会回退到固定平台列表构造 URL.
+   - **下载清单取自官方 SHA512SUMS**:直接拉取 `dl.k8s.io/<ver>/SHA512SUMS`,它末尾列出了各 `kubernetes-*.tar.gz` 包名及其 sha512 校验值.从中筛选 tar.gz 条目(默认仅 `kubernetes.tar.gz` + `kubernetes-client-*`,开启 `withsvr` 时含 server/node),下载 URL 由 `https://dl.k8s.io/<ver>/<文件名>` 直接组装,无需写死平台列表,且天然适配各版本架构.
 2. **并行下载全部二进制包**:基于 `xargs -P` 并发下载(默认 8 路并发,失败自动重试).
-3. **校验 SHA256**:使用 `dl.k8s.io/<ver>/SHA256SUMS` 逐个校验已下载文件,保证完整性.
+3. **校验完整性**:使用 SHA512SUMS 中解析出的 sha512 校验值,通过 `sha512sum -c` 逐文件校验.
 4. **发布到 Releases**:以版本号为 tag(如 `v1.33.6`),上传所有下载文件.
 
 > 调用 GitHub API 时已携带 `GITHUB_TOKEN` 鉴权,将限流从 60 次/小时提升到 5000 次/小时.
