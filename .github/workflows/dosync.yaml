@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: 拉取仓库代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 解析版本并生成下载清单
         id: plan
