@@ -1,12 +1,12 @@
 name: Do Tools Sync For Abldg
 
+# 共享同步逻辑位于私有仓库 shared_actions/sync_kubectl.yaml(组合 action)
+# 请将下方 OWNER 替换为你的 GitHub 组织/用户名
 on:
-  # schedule:
-  #   - cron: '0 2 10 * *'  # 每月10号凌晨2点自动执行(已屏蔽,不再定时执行)
   workflow_dispatch:
     inputs:
       binvern:
-        description: '指定Kubectl版本号(如 v1.33.6 或 1.33.6,不填则使用最新稳定版)'
+        description: '指定 Kubectl 版本号(如 v1.33.6 或 1.33.6,不填则使用最新稳定版)'
         required: false
         type: string
       withsvr:
@@ -18,117 +18,17 @@ on:
 permissions:
   contents: write
 
-# 并发控制:同一时间只允许一个同步任务运行,避免重复发布冲突
 concurrency:
   group: full-sync
   cancel-in-progress: false
-
-env:
-  DOWNLOAD_JOBS: 8          # 并行下载数
-  OWN: kubernetes/kubernetes
-  API: https://api.github.com/repos/kubernetes/kubernetes/releases
 
 jobs:
   sync_binaries:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: 拉取仓库代码
-        uses: actions/checkout@v7
-
-      - name: 解析版本并生成下载清单
-        id: plan
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 带鉴权,避免 API 限流(60次/小时 -> 5000次/小时)
-          WANT: ${{ inputs.binvern }}
-          WXSV: ${{ inputs.withsvr }}
-        run: |
-          set -euo pipefail
-          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
-
-          # 1. 确定目标版本:指定版本用 tags 接口精确命中,未指定用 latest
-          vnstr=latest
-          if [[ -n "${WANT:-}" ]]; then
-            vnstr="tags/v${WANT#v}"
-          fi
-          VN=$(curl -fsSL --retry 3 --retry-delay 2 "${auth[@]}" "${API}/${vnstr}" | jq -r '.tag_name')
-
-          # 最新版可能是预发布,兜底跳过 rc/beta/alpha
-          if [[ "${VN}" =~ -(rc|beta|alpha) ]]; then
-            echo "::error::解析到预发布版本 ${VN},请显式指定稳定版本号"
-            exit 1
-          fi
-
-          # 2. 生成下载清单
-          #    直接从官方 SHA512SUMS 获取 tar.gz 文件列表与校验值,下载 URL 由 "base/文件名" 组装。
-          curl -fsSL --retry 3 "https://dl.k8s.io/${VN}/SHA512SUMS" -o "${RUNNER_TEMP}/SHA512SUMS"
-
-          # 取 tar.gz 包条目(默认仅 client + 完整包,开启 withsvr 时含 server/node)
-          pat='kubernetes\.tar\.gz$|kubernetes-client-.*tar\.gz$'
-          if [[ "${WXSV:-0}" == "1" ]]; then
-            pat='kubernetes\.tar\.gz$|kubernetes-(client|server|node)-.*tar\.gz$'
-          fi
-          grep -E "$pat" "${RUNNER_TEMP}/SHA512SUMS" > "${RUNNER_TEMP}/manifest.sums"
-
-          # 过滤不支持的架构(如 loong)
-          grep -v 'loong' "${RUNNER_TEMP}/manifest.sums" > "${RUNNER_TEMP}/manifest.filtered.txt"
-          mv "${RUNNER_TEMP}/manifest.filtered.txt" "${RUNNER_TEMP}/manifest.sums"
-
-          if [[ ! -s "${RUNNER_TEMP}/manifest.sums" ]]; then
-            echo "::error::未找到任何可下载资源"
-            exit 1
-          fi
-
-          echo "version=${VN}" >> "${GITHUB_OUTPUT}"
-          echo "count=$(wc -l < "${RUNNER_TEMP}/manifest.sums")" >> "${GITHUB_OUTPUT}"
-          echo "base_url=https://dl.k8s.io/${VN}" >> "${GITHUB_OUTPUT}"
-          echo "解析到版本: ${VN} ($(wc -l < "${RUNNER_TEMP}/manifest.sums") 个资源)"
-
-      - name: 并行下载全部二进制包
-        env:
-          JOBS: ${{ env.DOWNLOAD_JOBS }}
-          VN: ${{ steps.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-
-          download_one() {
-            local sum="$1" name="$2"
-            local url="https://dl.k8s.io/${VN}/${name}"
-            for i in 1 2 3; do
-              if curl -4fL --retry 3 --retry-all-errors --retry-delay 2 \
-                    --connect-timeout 15 --max-time 1200 \
-                    -o "dist/${name}" "${url}"; then
-                return 0
-              fi
-              sleep $((i * 3))
-            done
-            echo "::error::下载失败: ${url}"
-            return 1
-          }
-          export -f download_one
-
-          # 清单每行: "<sha512>  <文件名>",取两列(校验值+文件名)并行下载,任一失败即整体失败
-          xargs -P "${JOBS}" -n 2 bash -c 'download_one "$@"' _ < "${RUNNER_TEMP}/manifest.sums"
-          echo "下载完成,文件数: $(find dist -type f | wc -l)"
-
-      - name: 校验完整性(SHA512)
-        run: |
-          set -euo pipefail
-          cd dist
-          # 用 SHA512SUMS 中解析出的校验值逐文件校验
-          sha512sum -c "${RUNNER_TEMP}/manifest.sums"
-
-      - name: 发布到 Releases
-        if: steps.plan.outputs.count != '0'
-        uses: softprops/action-gh-release@v3
+      - name: 同步 Kubectl 二进制
+        uses: abldgsync/shared_actions/sync_kubectl.yaml@v1
         with:
-          files: dist/*
-          tag_name: "${{ steps.plan.outputs.version }}" # 用版本号作为tag(如v1.33.6)
-          name: "Kubectl ${{ steps.plan.outputs.version }} Binaries"
-          body: |
-            手动从Kubectl官网同步二进制程序
-            - 版本: ${{ steps.plan.outputs.version }}
-            - 官网下载地址: ${{ steps.plan.outputs.base_url }}/TGZ_FILENAME
-          overwrite_files: true # 不覆盖已有版本(避免重复发布同一版本)
-          fail_on_unmatched_files: true
+          binvern: ${{ inputs.binvern }}
+          withsvr: ${{ inputs.withsvr }}
