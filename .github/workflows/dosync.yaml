@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: 同步 Kubectl 二进制
-        uses: abldgsync/shared_actions/sync_kubectl@5bc12b8bbec13ce4df71fc929a3b1ef893a9ef87
+        uses: abldgsync/shared_actions/sync_kubectl@main
         with:
           binvern: ${{ inputs.binvern }}
           withsvr: ${{ inputs.withsvr }}
